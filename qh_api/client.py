@@ -50,10 +50,18 @@ class QHAPIClient:
             raise QHAuthError(
                 f"Authentication failed ({resp.status_code})", resp.status_code, self._safe_body(resp)
             )
-        data = resp.json()
-        access = data.get("access")
+        body = self._safe_body(resp)
+        if not isinstance(body, dict):
+            raise QHAuthError(
+                f"Authentication returned a non-JSON body (status {resp.status_code}); "
+                f"the request likely never reached the QH API (proxy/firewall/WAF intercepted it). "
+                f"Body preview: {str(body)[:200]!r}",
+                resp.status_code,
+                body,
+            )
+        access = body.get("access")
         if not access:
-            raise QHAuthError("Authentication response missing 'access' token", resp.status_code, data)
+            raise QHAuthError("Authentication response missing 'access' token", resp.status_code, body)
         self._access_token = access
 
     @property
