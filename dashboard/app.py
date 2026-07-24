@@ -20,13 +20,24 @@ import data as data_mod
 import reaction as reaction_mod
 
 REACTION_WINDOW_MINUTES = 60
-ROLLING_YEARS = 5
+DEFAULT_HISTORY_YEARS = 5
+MAX_HISTORY_YEARS = 15
 
 st.set_page_config(page_title="US Gasoline Inventories & RB Structure", layout="wide")
 st.title("US Gasoline Inventories → RB Curve Structure & Pricing")
 
 today = dt.date.today()
-full_start = (today - dt.timedelta(days=ROLLING_YEARS * 365)).isoformat()
+
+# Use complete calendar years rather than a rolling day window. For example,
+# five years in 2026 loads data from 2022-01-01 onward.
+history_years = st.selectbox(
+    "Number of years",
+    options=list(range(1, MAX_HISTORY_YEARS + 1)),
+    index=DEFAULT_HISTORY_YEARS - 1,
+    help="Controls how many calendar years are loaded. The default is 5 years.",
+)
+history_start_year = today.year - history_years + 1
+full_start = dt.date(history_start_year, 1, 1).isoformat()
 
 with st.spinner("Loading gasoline stocks data..."):
     stocks_df = data_mod.fetch_fundamental_series(data_mod.GASOLINE_STOCKS_QHCODE, start_date=full_start)
@@ -38,152 +49,123 @@ if stocks_df.empty:
 stocks_df["wow_change"] = stocks_df["actual"].diff()
 stocks_df["wow_pct"] = stocks_df["actual"].pct_change() * 100
 all_weeks = list(stocks_df["date"])
-min_year, max_year = stocks_df["date"].min().year, stocks_df["date"].max().year
-
-# ---------------------------------------------------------------- Top controls
-st.subheader("Year Range")
-preset_cols = st.columns(4)
-if preset_cols[0].button("Last 1Y"):
-    st.session_state["year_range"] = (max_year, max_year)
-if preset_cols[1].button("Last 3Y"):
-    st.session_state["year_range"] = (max(min_year, max_year - 2), max_year)
-if preset_cols[2].button(f"Full History ({ROLLING_YEARS}Y)"):
-    st.session_state["year_range"] = (min_year, max_year)
-if preset_cols[3].button("Reset"):
-    st.session_state.pop("year_range", None)
-
-year_range = st.select_slider(
-    "Select year range",
-    options=list(range(min_year, max_year + 1)),
-    value=st.session_state.get("year_range", (min_year, max_year)),
-    key="year_range",
-)
-start_year, end_year = year_range if isinstance(year_range, tuple) else (year_range, year_range)
-
-view_df = stocks_df[
-    (stocks_df["date"].dt.year >= start_year) & (stocks_df["date"].dt.year <= end_year)
-].reset_index(drop=True)
-
-if view_df.empty:
-    st.warning("No data in the selected year range.")
-    st.stop()
+view_df = stocks_df
 
 st.caption(
     f"Showing {len(view_df)} weekly reports from {view_df['date'].min().date()} to {view_df['date'].max().date()} "
-    f"(data available back to {min_year}, rolling {ROLLING_YEARS}-year window)."
+    f"(loaded {history_years} calendar year{'s' if history_years != 1 else ''}, starting {full_start})."
 )
 
-left_col, right_col = st.columns([3, 4])
-
-# ---------------------------------------------------------------- Left: main chart
+# ---------------------------------------------------------------- Full-width inventory chart
 # Seasonal palette: muted history, most recent year bold/highlighted.
 _SEASONAL_PALETTE = ["#d62728", "#ff7f0e", "#2ca02c", "#9467bd", "#1f77b4", "#8c564b", "#e377c2", "#7f7f7f"]
 
-with left_col:
-    st.subheader("US Gasoline Stocks - Weekly (EIA)")
-    view_mode = st.radio(
-        "View", ["Absolute Inventory", "Week-on-Week Change", "% Week-on-Week Change"], horizontal=True
-    )
+st.subheader("US Gasoline Stocks - Weekly (EIA)")
+view_mode = st.radio(
+    "View", ["Absolute Inventory", "Week-on-Week Change", "% Week-on-Week Change"], horizontal=True
+)
 
-    if view_mode == "Absolute Inventory":
-        metric_col, y_title = "actual", "K BBL"
-    elif view_mode == "Week-on-Week Change":
-        metric_col, y_title = "wow_change", "Change (K BBL)"
-    else:
-        metric_col, y_title = "wow_pct", "% Change"
+if view_mode == "Absolute Inventory":
+    metric_col, y_title = "actual", "K BBL"
+elif view_mode == "Week-on-Week Change":
+    metric_col, y_title = "wow_change", "Change (K BBL)"
+else:
+    metric_col, y_title = "wow_pct", "% Change"
 
-    plot_df = view_df.copy()
-    plot_df["plot_year"] = plot_df["date"].dt.year
-    plot_df["plot_date"] = plot_df["date"].apply(lambda d: d.replace(year=2000))
-    years_sorted = sorted(plot_df["plot_year"].unique())
+plot_df = view_df.copy()
+plot_df["plot_year"] = plot_df["date"].dt.year
+plot_df["plot_date"] = plot_df["date"].apply(lambda d: d.replace(year=2000))
+years_sorted = sorted(plot_df["plot_year"].unique())
 
-    fig = go.Figure()
-    for i, yr in enumerate(years_sorted):
-        yr_df = plot_df[plot_df["plot_year"] == yr].sort_values("plot_date")
-        is_latest = yr == years_sorted[-1]
-        customdata = yr_df[["date", "actual", "wow_change", "wow_pct"]].astype(str).to_numpy()
-        fig.add_trace(
-            go.Scatter(
-                x=yr_df["plot_date"],
-                y=yr_df[metric_col],
-                mode="lines+markers",
-                name=str(yr),
-                customdata=customdata,
-                line=dict(
-                    color=_SEASONAL_PALETTE[i % len(_SEASONAL_PALETTE)],
-                    width=3 if is_latest else 1.5,
-                ),
-                marker=dict(size=5 if is_latest else 3),
-                hovertemplate=(
-                    "Week: %{customdata[0]}<br>"
-                    "Value: %{customdata[1]} K BBL<br>"
-                    "WoW: %{customdata[2]}<br>"
-                    "%% Change: %{customdata[3]}%<extra>" + str(yr) + "</extra>"
-                ),
-            )
+fig = go.Figure()
+for i, yr in enumerate(years_sorted):
+    yr_df = plot_df[plot_df["plot_year"] == yr].sort_values("plot_date")
+    is_latest = yr == years_sorted[-1]
+    customdata = yr_df[["date", "actual", "wow_change", "wow_pct"]].astype(str).to_numpy()
+    fig.add_trace(
+        go.Scatter(
+            x=yr_df["plot_date"],
+            y=yr_df[metric_col],
+            mode="lines+markers",
+            name=str(yr),
+            customdata=customdata,
+            line=dict(
+                color=_SEASONAL_PALETTE[i % len(_SEASONAL_PALETTE)],
+                width=3 if is_latest else 1.5,
+            ),
+            marker=dict(size=5 if is_latest else 3),
+            hovertemplate=(
+                "Week: %{customdata[0]}<br>"
+                "Value: %{customdata[1]} K BBL<br>"
+                "WoW: %{customdata[2]}<br>"
+                "%% Change: %{customdata[3]}%<extra>" + str(yr) + "</extra>"
+            ),
         )
-    fig.update_layout(
-        height=460,
-        yaxis_title=y_title,
-        xaxis=dict(tickformat="%m-%d"),
-        margin=dict(t=20, b=20),
-        legend_title_text="Year (click to toggle)",
     )
+fig.update_layout(
+    height=500,
+    yaxis_title=y_title,
+    xaxis=dict(tickformat="%m-%d"),
+    margin=dict(t=20, b=20),
+    legend_title_text="Year (click to toggle)",
+)
 
-    click_event = st.plotly_chart(
-        fig, on_select="rerun", selection_mode="points", key="stocks_chart", use_container_width=True
-    )
+click_event = st.plotly_chart(
+    fig, on_select="rerun", selection_mode="points", key="stocks_chart", use_container_width=True
+)
 
+clicked_date = None
+try:
+    points = click_event["selection"]["points"]
+    if points:
+        clicked_date = pd.Timestamp(points[0]["customdata"][0])
+except Exception:
     clicked_date = None
-    try:
-        points = click_event["selection"]["points"]
-        if points:
-            clicked_date = pd.Timestamp(points[0]["customdata"][0])
-    except Exception:
-        clicked_date = None
 
-    week_options = list(view_df["date"])
-    if "selected_week_slider" not in st.session_state or st.session_state["selected_week_slider"] not in week_options:
-        st.session_state["selected_week_slider"] = week_options[-1]
-    if clicked_date in week_options:
-        st.session_state["selected_week_slider"] = clicked_date
+week_options = list(view_df["date"])
+if "selected_week_slider" not in st.session_state or st.session_state["selected_week_slider"] not in week_options:
+    st.session_state["selected_week_slider"] = week_options[-1]
+if clicked_date in week_options:
+    st.session_state["selected_week_slider"] = clicked_date
 
-    selected_week = st.select_slider(
-        "Selected week (click a point above, or use this slider)",
-        options=week_options,
-        format_func=lambda d: d.strftime("%Y-%m-%d"),
-        key="selected_week_slider",
-    )
-    st.markdown(f"**Selected week: {selected_week.date()}**")
+selected_week = st.select_slider(
+    "Selected week (click a point above, or use this slider)",
+    options=week_options,
+    format_func=lambda d: d.strftime("%Y-%m-%d"),
+    key="selected_week_slider",
+)
+st.markdown(f"**Selected week: {selected_week.date()}**")
 
-# ---------------------------------------------------------------- Right: 3 sections
-with right_col:
-    # Section 1: RB Curve Structure (full forward strip, current vs. compare date)
-    st.subheader("1. RB Curve Structure")
-    ctrl_cols = st.columns(2)
-    contract_range = ctrl_cols[0].number_input(
-        "Contract range (months forward)", min_value=4, max_value=30, value=19, step=1, key="contract_range"
-    )
-    try:
-        default_compare_idx = max(0, all_weeks.index(selected_week) - 1)
-    except ValueError:
-        default_compare_idx = max(0, len(all_weeks) - 2)
-    compare_week = ctrl_cols[1].selectbox(
-        "Change from (compare date)",
-        options=list(reversed(all_weeks)),
-        index=len(all_weeks) - 1 - default_compare_idx,
-        format_func=lambda d: d.strftime("%Y-%m-%d"),
-        key="compare_week",
-    )
+# ---------------------------------------------------------------- Full-width curve row
+st.divider()
+st.subheader("1. RB Curve Structure")
+ctrl_cols = st.columns(2)
+contract_range = ctrl_cols[0].number_input(
+    "Contract range (months forward)", min_value=4, max_value=30, value=19, step=1, key="contract_range"
+)
+try:
+    default_compare_idx = max(0, all_weeks.index(selected_week) - 1)
+except ValueError:
+    default_compare_idx = max(0, len(all_weeks) - 2)
+compare_week = ctrl_cols[1].selectbox(
+    "Change from (compare date)",
+    options=list(reversed(all_weeks)),
+    index=len(all_weeks) - 1 - default_compare_idx,
+    format_func=lambda d: d.strftime("%Y-%m-%d"),
+    key="compare_week",
+)
 
-    strip_data = analytics.curve_strip_snapshot(selected_week, compare_week, contract_range)
-    front_month_code = curves.contract_code(*strip_data["chain"][0])
-    st.caption(
-        f"Front-month chain starts at {front_month_code} (nearest unexpired as of {selected_week.date()}), "
-        f"{contract_range} contracts forward. Comparing {selected_week.date()} (orange) vs {compare_week.date()} (white)."
-    )
+strip_data = analytics.curve_strip_snapshot(selected_week, compare_week, contract_range)
+front_month_code = curves.contract_code(*strip_data["chain"][0])
+front_spread_code = curves.combo_code(strip_data["chain"], 2)
+st.caption(
+    f"Front-month chain starts at {front_month_code} (nearest unexpired as of {selected_week.date()}), "
+    f"{contract_range} contracts forward. Comparing {selected_week.date()} (orange) vs {compare_week.date()} (white)."
+)
 
-    for structure_name in ("1MS", "1MF", "1MDF"):
+curve_cols = st.columns(3, gap="small")
+for curve_col, structure_name in zip(curve_cols, ("1MS", "1MF", "1MDF")):
+    with curve_col:
         sdf = strip_data["structures"][structure_name]
         if sdf.empty or sdf["current"].isna().all():
             st.info(f"No data available for {structure_name} across this contract range.")
@@ -199,23 +181,36 @@ with right_col:
                        line=dict(color="#ff7f0e", width=2))
         )
         fig_s.update_layout(
-            title=f"RB - {structure_name}", height=240, margin=dict(t=30, b=10), yaxis_title="$/gal",
-            legend=dict(orientation="h", y=1.15),
+            title=f"RB - {structure_name}",
+            height=330,
+            margin=dict(t=45, b=25, l=45, r=10),
+            yaxis_title="$/gal",
+            legend=dict(orientation="h", y=1.16, x=0),
         )
         st.plotly_chart(fig_s, use_container_width=True, key=f"strip_{structure_name}")
+        calculated_sources = pd.concat(
+            [sdf["current_source"], sdf["compare_source"]], ignore_index=True
+        ).dropna()
+        calculated_sources = sorted(
+            source for source in calculated_sources.unique() if source != "QH API"
+        )
+        if calculated_sources:
+            st.caption(f"{structure_name} fallback used: {', '.join(calculated_sources)}.")
 
-    st.caption(
-        "1MS = adjacent-month spread, 1MF = 3-month fly, 1MDF = 4-month double fly (QH's own combo instruments), "
-        "plotted across the full forward strip. Bars = change between the two dates."
-    )
+st.caption(
+    "1MS = adjacent-month spread; 1MF[i] = 1MS[i] - 1MS[i+1]; "
+    "1MDF[i] = 1MF[i] - 1MF[i+1]. QH combo values are used when available, "
+    "with calculated values only filling missing API points. Bars = change between the two dates."
+)
 
-    st.divider()
+# ---------------------------------------------------------------- Bottom row
+st.divider()
+inventory_col, crack_col = st.columns(2, gap="large")
 
-    # Section 2: Inventory Breakdown & Market Reaction
+with inventory_col:
     st.subheader("2. Inventory Breakdown & Market Reaction")
     padd_df = data_mod.fetch_all_padd_stocks(start_date=full_start)
 
-    snapshot = {"Total": stocks_df.loc[stocks_df["date"] == selected_week, "actual"]}
     bars = []
     total_val = stocks_df.loc[stocks_df["date"] == selected_week, "actual"]
     if not total_val.empty:
@@ -261,29 +256,34 @@ with right_col:
     except ValueError:
         pass
 
-    st.markdown("**Release reaction (RB front-month, +%d min window)**" % REACTION_WINDOW_MINUTES)
-    reaction_result = reaction_mod.price_reaction(front_month_code, selected_week, REACTION_WINDOW_MINUTES)
-    if reaction_result:
-        r_cols = st.columns(3)
-        r_cols[0].metric("Pre-release", f"${reaction_result['pre_price']:.4f}")
-        r_cols[1].metric(
-            "Post-release", f"${reaction_result['post_price']:.4f}",
-            delta=f"{reaction_result['change']:+.4f}",
+    st.markdown("**Release reaction (+%d min window)**" % REACTION_WINDOW_MINUTES)
+    for reaction_label, reaction_code in (
+        ("RB front month", front_month_code),
+        ("RB 1MS", front_spread_code),
+    ):
+        st.markdown(f"**{reaction_label} — {reaction_code}**")
+        reaction_result = reaction_mod.price_reaction(
+            reaction_code, selected_week, REACTION_WINDOW_MINUTES
         )
-        pct = reaction_result["pct_change"]
-        r_cols[2].metric("% Move", f"{pct:+.2f}%" if pct is not None else "n/a")
-        release_et = reaction_result["release_time_utc"].tz_convert("America/New_York")
-        st.caption(
-            f"Release assumed at {release_et.strftime('%Y-%m-%d %H:%M %Z')} "
-            "(standard EIA weekly schedule, Thursday if Monday is a federal holiday). "
-            f"Instrument: {front_month_code}."
-        )
-    else:
-        st.info("No intraday (5-minute) data available to compute the release reaction for this week.")
+        if reaction_result:
+            r_cols = st.columns(3)
+            r_cols[0].metric("Pre-release", f"{reaction_result['pre_price']:.4f}")
+            r_cols[1].metric(
+                "Post-release",
+                f"{reaction_result['post_price']:.4f}",
+                delta=f"{reaction_result['change']:+.4f}",
+            )
+            pct = reaction_result["pct_change"]
+            r_cols[2].metric("% Move", f"{pct:+.2f}%" if pct is not None else "n/a")
+            release_et = reaction_result["release_time_utc"].tz_convert("America/New_York")
+            st.caption(
+                f"Release at {release_et.strftime('%Y-%m-%d %H:%M %Z')}; "
+                "holiday-adjusted EIA calendar."
+            )
+        else:
+            st.info(f"No intraday (5-minute) data available for {reaction_code} in this release window.")
 
-    st.divider()
-
-    # Section 3: Crack Spread Context
+with crack_col:
     st.subheader("3. Gasoline Crack Spread Context")
     crack_span = st.slider("Weeks each side of selected week", 2, 4, 3, key="crack_span")
     crack_df = analytics.crack_series(selected_week, crack_span, crack_span, all_weeks)
@@ -299,4 +299,108 @@ with right_col:
         st.caption(
             "Front-month RB-CL crack spread (RBCL<contract>), re-resolved per week so contract rolls "
             "don't create artificial jumps. Dashed line marks the selected week."
+        )
+
+    st.markdown("**PADD draw/build vs RB 1MS one-hour move**")
+    correlation_lookback = st.selectbox(
+        "Correlation lookback (EIA releases)",
+        options=[13, 26, 48],
+        index=1,
+        key="correlation_lookback",
+    )
+    with st.spinner("Loading historical one-hour RB 1MS reactions..."):
+        reaction_history = analytics.historical_1ms_reactions(
+            all_weeks,
+            lookback_weeks=correlation_lookback,
+            window_minutes=REACTION_WINDOW_MINUTES,
+        )
+    if reaction_history.empty or reaction_history["move_1h"].isna().all():
+        st.info("No historical RB 1MS release reactions available for this lookback.")
+    else:
+        inventory_changes = stocks_df[["date", "wow_change"]].rename(
+            columns={"wow_change": "Total US"}
+        )
+        if not padd_df.empty:
+            padd_changes = padd_df.sort_values("date").copy()
+            for padd in range(1, 6):
+                col = f"PADD{padd}"
+                if col in padd_changes:
+                    padd_changes[col] = padd_changes[col].diff()
+            inventory_changes = inventory_changes.merge(
+                padd_changes, on="date", how="left"
+            )
+
+        corr_df = inventory_changes.merge(
+            reaction_history,
+            left_on="date",
+            right_on="week",
+            how="inner",
+        )
+        correlation_rows = []
+        for region in ["Total US", "PADD1", "PADD2", "PADD3", "PADD4", "PADD5"]:
+            if region not in corr_df:
+                continue
+            paired = corr_df[[region, "move_1h"]].dropna()
+            # Trading convention: inventory tightening is positive. Therefore a
+            # draw (negative raw EIA change) becomes positive, while a build
+            # becomes negative. A positive correlation then reads intuitively as
+            # larger draw/tighter stocks -> stronger (upward) RB 1MS.
+            inventory_tightness = -paired[region]
+            avg_inventory_change = paired[region].mean() if not paired.empty else None
+            avg_spread_move = paired["move_1h"].mean() if not paired.empty else None
+            if pd.notna(avg_inventory_change):
+                inventory_direction = "build" if avg_inventory_change >= 0 else "draw"
+                avg_inventory = f"{abs(avg_inventory_change):,.0f} K BBL {inventory_direction}"
+            else:
+                avg_inventory = "n/a"
+            correlation_rows.append(
+                {
+                    "region": region,
+                    "correlation": inventory_tightness.corr(paired["move_1h"]),
+                    "observations": len(paired),
+                    "avg_inventory": avg_inventory,
+                    "avg_spread_move": (
+                        f"{avg_spread_move:+.4f}" if pd.notna(avg_spread_move) else "n/a"
+                    ),
+                }
+            )
+
+        correlation_df = pd.DataFrame(correlation_rows)
+        fig_corr = go.Figure(
+            go.Bar(
+                x=correlation_df["region"],
+                y=correlation_df["correlation"],
+                customdata=correlation_df[
+                    ["observations", "avg_inventory", "avg_spread_move"]
+                ],
+                text=correlation_df["correlation"].map(
+                    lambda value: f"{value:.2f}" if pd.notna(value) else "n/a"
+                ),
+                textposition="outside",
+                marker_color=[
+                    "#2ca02c" if pd.notna(value) and value >= 0 else "#d62728"
+                    for value in correlation_df["correlation"]
+                ],
+                hovertemplate=(
+                    "%{x}<br>Pearson r: %{y:.3f}<br>"
+                    "Observations: %{customdata[0]}<br>"
+                    "Average inventory: %{customdata[1]}<br>"
+                    "Average 1MS move: %{customdata[2]} $/gal"
+                    "<extra></extra>"
+                ),
+            )
+        )
+        fig_corr.add_hline(y=0, line_color="gray", line_width=1)
+        fig_corr.update_layout(
+            height=300,
+            margin=dict(t=20, b=20),
+            yaxis=dict(title="Correlation (draw positive)", range=[-1, 1]),
+        )
+        st.plotly_chart(fig_corr, use_container_width=True, key="padd_1ms_correlation")
+        valid_reactions = reaction_history["move_1h"].notna().sum()
+        st.caption(
+            f"Trading-sign correlation: inventory draws are positive and builds are negative, "
+            f"compared with the signed RB 1MS price change from release time to +{REACTION_WINDOW_MINUTES} minutes. "
+            f"Green means larger draws align with a stronger 1MS; red means the relationship is inverse. "
+            f"{valid_reactions} of {len(reaction_history)} requested releases had usable intraday data."
         )

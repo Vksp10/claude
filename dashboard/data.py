@@ -5,6 +5,7 @@ from urllib.parse import parse_qs, urlparse
 import pandas as pd
 import streamlit as st
 
+import eia_calendar
 from qh_api import QHAPIClient, QHAPIError
 
 GASOLINE_STOCKS_QHCODE = "US Gasoline Stocks_1W"
@@ -50,6 +51,9 @@ def fetch_fundamental_series(qhcode: str, start_date: str, end_date: str | None 
     if df.empty:
         return df
     df["date"] = pd.to_datetime(df["date"])
+    # QH labels EIA weekly observations with Friday. Align every weekly series
+    # to its actual EIA publication date, including holiday-delayed releases.
+    df["date"] = df["date"].map(eia_calendar.release_date_from_qh_label)
     df["actual"] = pd.to_numeric(df["actual"], errors="coerce")
     return df[["date", "actual"]].drop_duplicates("date").sort_values("date").reset_index(drop=True)
 
