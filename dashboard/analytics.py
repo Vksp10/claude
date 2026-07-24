@@ -7,6 +7,9 @@ import curves
 import data as data_mod
 import eia_calendar
 
+RB_1MS_TICK_SIZE = 0.0001
+RB_1MS_TICK_VALUE = 4.2
+
 
 def _nearest_close(df: pd.DataFrame, as_of: pd.Timestamp) -> float | None:
     if df.empty:
@@ -169,6 +172,137 @@ def historical_1ms_reactions(
         rows.append(row)
 
     return pd.DataFrame(rows).sort_values("week").reset_index(drop=True)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def backtest_inventory_signal_1ms(
+    signal_rows: tuple[tuple[str, float], ...],
+    lookback_months: int,
+    holding_minutes: int,
+    stop_dollars: float,
+    target_mode: str,
+    target_value: float,
+) -> pd.DataFrame:
+    """Backtest draw-long/build-short RB 1MS trades around EIA releases.
+
+    The trade enters at the open of the first five-minute bar timestamped at or
+    after the EIA release. Stops and targets are expressed as P&L dollars for
+    one RB 1MS spread, using a 0.0001 tick worth $4.20. If both levels trade in
+    the same bar, the stop is assumed to fill first (conservative sequencing).
+    """
+    if not signal_rows:
+        return pd.DataFrame()
+
+    signals = pd.DataFrame(signal_rows, columns=["week", "inventory_change"])
+    signals["week"] = pd.to_datetime(signals["week"])
+    signals["inventory_change"] = pd.to_numeric(
+        signals["inventory_change"], errors="coerce"
+    )
+    signals = signals.dropna().sort_values("week")
+    if signals.empty:
+        return pd.DataFrame()
+
+    cutoff = signals["week"].max() - pd.DateOffset(months=int(lookback_months))
+    signals = signals[signals["week"] >= cutoff]
+    stop_offset = float(stop_dollars) / RB_1MS_TICK_VALUE * RB_1MS_TICK_SIZE
+    target_dollars = (
+        float(stop_dollars) * float(target_value)
+        if target_mode == "Stop multiple"
+        else float(target_value)
+    )
+    target_offset = target_dollars / RB_1MS_TICK_VALUE * RB_1MS_TICK_SIZE
+
+    results = []
+    for signal in signals.itertuples(index=False):
+        week = pd.Timestamp(signal.week)
+        inventory_change = float(signal.inventory_change)
+        if inventory_change == 0:
+            continue
+
+        direction = 1 if inventory_change < 0 else -1
+        side = "Long" if direction == 1 else "Short"
+        signal_name = "Draw" if direction == 1 else "Build"
+        chain = curves.front_month_chain(week.date(), 2)
+        spread_code = curves.combo_code(chain, 2)
+        release_utc = eia_calendar.release_datetime_utc(week)
+        holding_end = release_utc + pd.Timedelta(minutes=int(holding_minutes))
+
+        try:
+            event_bars = data_mod.fetch_ohlc_v2(
+                (spread_code,),
+                interval="5M",
+                # Match the reaction-panel request window so the shared
+                # fetch_ohlc_v2 cache prevents duplicate API calls.
+                start=int((release_utc - pd.Timedelta(minutes=5)).timestamp()),
+                end=int(holding_end.timestamp()),
+            )
+        except Exception:
+            event_bars = pd.DataFrame()
+
+        if event_bars.empty:
+            continue
+        event_bars = event_bars[
+            (event_bars["product"] == spread_code)
+            & (event_bars["time"] >= release_utc)
+            & (event_bars["time"] <= holding_end)
+        ].sort_values("time")
+        if event_bars.empty:
+            continue
+
+        entry_bar = event_bars.iloc[0]
+        entry_price = float(entry_bar["open"])
+        stop_price = entry_price - direction * stop_offset
+        target_price = entry_price + direction * target_offset
+        exit_price = float(event_bars.iloc[-1]["close"])
+        exit_time = event_bars.iloc[-1]["time"]
+        exit_reason = "Holding-period exit"
+
+        for bar in event_bars.itertuples(index=False):
+            bar_high = float(bar.high)
+            bar_low = float(bar.low)
+            if direction == 1:
+                stop_hit = bar_low <= stop_price
+                target_hit = bar_high >= target_price
+            else:
+                stop_hit = bar_high >= stop_price
+                target_hit = bar_low <= target_price
+
+            if stop_hit:
+                exit_price = stop_price
+                exit_time = bar.time
+                exit_reason = "Stop"
+                break
+            if target_hit:
+                exit_price = target_price
+                exit_time = bar.time
+                exit_reason = "Target"
+                break
+
+        signed_price_move = (exit_price - entry_price) * direction
+        pnl_dollars = (
+            signed_price_move / RB_1MS_TICK_SIZE * RB_1MS_TICK_VALUE
+        )
+        results.append(
+            {
+                "week": week,
+                "signal": signal_name,
+                "side": side,
+                "inventory_change": inventory_change,
+                "spread_code": spread_code,
+                "entry_time": entry_bar["time"],
+                "exit_time": exit_time,
+                "entry_price": entry_price,
+                "exit_price": exit_price,
+                "exit_reason": exit_reason,
+                "pnl_dollars": pnl_dollars,
+            }
+        )
+
+    if not results:
+        return pd.DataFrame()
+    result = pd.DataFrame(results).sort_values("week").reset_index(drop=True)
+    result["cumulative_pnl"] = result["pnl_dollars"].cumsum()
+    return result
 
 
 def crack_series(center_week: pd.Timestamp, weeks_before: int, weeks_after: int, all_weeks: list[pd.Timestamp]) -> pd.DataFrame:

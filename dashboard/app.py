@@ -138,7 +138,7 @@ st.markdown(f"**Selected week: {selected_week.date()}**")
 
 # ---------------------------------------------------------------- Full-width curve row
 st.divider()
-st.subheader("1. RB Curve Structure")
+st.subheader("RB Curve Structure")
 ctrl_cols = st.columns(2)
 contract_range = ctrl_cols[0].number_input(
     "Contract range (months forward)", min_value=4, max_value=30, value=19, step=1, key="contract_range"
@@ -208,7 +208,7 @@ st.divider()
 inventory_col, crack_col = st.columns(2, gap="large")
 
 with inventory_col:
-    st.subheader("2. Inventory Breakdown & Market Reaction")
+    st.subheader("Inventory Breakdown & Market Reaction")
     padd_df = data_mod.fetch_all_padd_stocks(start_date=full_start)
 
     bars = []
@@ -256,7 +256,7 @@ with inventory_col:
     except ValueError:
         pass
 
-    st.markdown("**Release reaction (+%d min window)**" % REACTION_WINDOW_MINUTES)
+    st.subheader("Release Reaction (+%d Min Window)" % REACTION_WINDOW_MINUTES)
     for reaction_label, reaction_code in (
         ("RB front month", front_month_code),
         ("RB 1MS", front_spread_code),
@@ -283,8 +283,224 @@ with inventory_col:
         else:
             st.info(f"No intraday (5-minute) data available for {reaction_code} in this release window.")
 
+    st.subheader("Inventory Signal Strategy Backtest")
+    bt_row_1 = st.columns(3)
+    strategy_region = bt_row_1[0].selectbox(
+        "Inventory signal",
+        options=["Total US", "PADD1", "PADD2", "PADD3", "PADD4", "PADD5"],
+        key="strategy_region",
+    )
+    strategy_lookback_months = int(
+        bt_row_1[1].number_input(
+            "Lookback (months)",
+            min_value=1,
+            max_value=24,
+            value=6,
+            step=1,
+            key="strategy_lookback_months",
+        )
+    )
+    holding_label = bt_row_1[2].selectbox(
+        "Maximum holding period",
+        options=["30 minutes", "1 hour", "2 hours", "4 hours", "6 hours"],
+        index=1,
+        key="strategy_holding_period",
+    )
+    holding_minutes = {
+        "30 minutes": 30,
+        "1 hour": 60,
+        "2 hours": 120,
+        "4 hours": 240,
+        "6 hours": 360,
+    }[holding_label]
+
+    bt_row_2 = st.columns(3)
+    stop_dollars = float(
+        bt_row_2[0].number_input(
+            "Dollar stop (per spread)",
+            min_value=4.2,
+            value=420.0,
+            step=4.2,
+            format="%.2f",
+            key="strategy_stop_dollars",
+        )
+    )
+    target_mode = bt_row_2[1].radio(
+        "Target method",
+        options=["Stop multiple", "Dollar target"],
+        horizontal=True,
+        key="strategy_target_mode",
+    )
+    if target_mode == "Stop multiple":
+        target_value = float(
+            bt_row_2[2].number_input(
+                "Target (× stop)",
+                min_value=0.25,
+                value=2.0,
+                step=0.25,
+                key="strategy_target_multiple",
+            )
+        )
+        target_dollars = stop_dollars * target_value
+    else:
+        target_value = float(
+            bt_row_2[2].number_input(
+                "Dollar target (per spread)",
+                min_value=4.2,
+                value=840.0,
+                step=4.2,
+                format="%.2f",
+                key="strategy_target_dollars",
+            )
+        )
+        target_dollars = target_value
+
+    if strategy_region == "Total US":
+        strategy_signal_df = stocks_df[["date", "wow_change"]].rename(
+            columns={"wow_change": "inventory_change"}
+        )
+    elif not padd_df.empty and strategy_region in padd_df:
+        strategy_signal_df = padd_df[["date", strategy_region]].sort_values("date").copy()
+        strategy_signal_df["inventory_change"] = strategy_signal_df[strategy_region].diff()
+        strategy_signal_df = strategy_signal_df[["date", "inventory_change"]]
+    else:
+        strategy_signal_df = pd.DataFrame()
+
+    if strategy_signal_df.empty:
+        st.info(f"No inventory history is available for {strategy_region}.")
+    else:
+        strategy_signal_rows = tuple(
+            (row.date.isoformat(), float(row.inventory_change))
+            for row in strategy_signal_df.dropna().itertuples(index=False)
+        )
+        with st.spinner("Backtesting RB 1MS release trades..."):
+            strategy_results = analytics.backtest_inventory_signal_1ms(
+                strategy_signal_rows,
+                lookback_months=strategy_lookback_months,
+                holding_minutes=holding_minutes,
+                stop_dollars=stop_dollars,
+                target_mode=target_mode,
+                target_value=target_value,
+            )
+
+        if strategy_results.empty:
+            st.info("No usable RB 1MS event bars were returned for this configuration.")
+        else:
+            total_pnl = strategy_results["pnl_dollars"].sum()
+            average_pnl = strategy_results["pnl_dollars"].mean()
+            win_rate = (strategy_results["pnl_dollars"] > 0).mean() * 100
+            strategy_metrics = st.columns(4)
+            strategy_metrics[0].metric("Total P&L", f"${total_pnl:,.0f}")
+            strategy_metrics[1].metric("Average / Trade", f"${average_pnl:,.0f}")
+            strategy_metrics[2].metric("Win Rate", f"{win_rate:.1f}%")
+            strategy_metrics[3].metric("Trades", f"{len(strategy_results)}")
+
+            fig_strategy = go.Figure()
+            fig_strategy.add_trace(
+                go.Bar(
+                    x=strategy_results["week"],
+                    y=strategy_results["pnl_dollars"],
+                    name="Trade P&L",
+                    marker_color=[
+                        "#2ca02c" if value >= 0 else "#d62728"
+                        for value in strategy_results["pnl_dollars"]
+                    ],
+                    customdata=strategy_results[
+                        ["signal", "side", "inventory_change", "exit_reason"]
+                    ],
+                    hovertemplate=(
+                        "%{x|%Y-%m-%d}<br>"
+                        "%{customdata[0]} → %{customdata[1]}<br>"
+                        "Inventory change: %{customdata[2]:,.0f} K BBL<br>"
+                        "Exit: %{customdata[3]}<br>"
+                        "Trade P&L: $%{y:,.0f}<extra></extra>"
+                    ),
+                )
+            )
+            fig_strategy.add_trace(
+                go.Scatter(
+                    x=strategy_results["week"],
+                    y=strategy_results["cumulative_pnl"],
+                    mode="lines+markers",
+                    name="Cumulative P&L",
+                    yaxis="y2",
+                    line=dict(color="#1f77b4", width=2),
+                )
+            )
+            fig_strategy.update_layout(
+                height=330,
+                margin=dict(t=25, b=20),
+                yaxis=dict(title="Trade P&L ($)"),
+                yaxis2=dict(
+                    title="Cumulative P&L ($)",
+                    overlaying="y",
+                    side="right",
+                    showgrid=False,
+                ),
+                legend=dict(orientation="h", y=1.12),
+            )
+            st.plotly_chart(
+                fig_strategy,
+                use_container_width=True,
+                key="inventory_signal_strategy_chart",
+            )
+
+            strategy_table = strategy_results.copy()
+            strategy_table["week"] = strategy_table["week"].dt.strftime("%Y-%m-%d")
+            strategy_table["entry_time"] = (
+                strategy_table["entry_time"]
+                .dt.tz_convert("America/New_York")
+                .dt.strftime("%Y-%m-%d %H:%M")
+            )
+            strategy_table["exit_time"] = (
+                strategy_table["exit_time"]
+                .dt.tz_convert("America/New_York")
+                .dt.strftime("%Y-%m-%d %H:%M")
+            )
+            strategy_table = strategy_table.rename(
+                columns={
+                    "week": "Release",
+                    "signal": "Signal",
+                    "side": "Side",
+                    "inventory_change": "Inventory Change (K BBL)",
+                    "spread_code": "RB 1MS",
+                    "entry_time": "Entry (ET)",
+                    "exit_time": "Exit (ET)",
+                    "entry_price": "Entry",
+                    "exit_price": "Exit",
+                    "exit_reason": "Exit Reason",
+                    "pnl_dollars": "P&L ($)",
+                }
+            )
+            st.dataframe(
+                strategy_table[
+                    [
+                        "Release",
+                        "Signal",
+                        "Side",
+                        "Inventory Change (K BBL)",
+                        "RB 1MS",
+                        "Entry (ET)",
+                        "Exit (ET)",
+                        "Entry",
+                        "Exit",
+                        "Exit Reason",
+                        "P&L ($)",
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.caption(
+            f"One RB 1MS spread: 0.0001 tick = \\$4.20. Draws enter long; builds enter short "
+            f"at the first 5-minute bar open after release. Stop \\${stop_dollars:,.2f}; "
+            f"target \\${target_dollars:,.2f}; maximum hold {holding_label.lower()}. "
+            "If stop and target trade within the same bar, the stop is applied first."
+        )
+
 with crack_col:
-    st.subheader("3. Gasoline Crack Spread Context")
+    st.subheader("Gasoline Crack Spread Context")
     crack_span = st.slider("Weeks each side of selected week", 2, 4, 3, key="crack_span")
     crack_df = analytics.crack_series(selected_week, crack_span, crack_span, all_weeks)
     if crack_df.empty or crack_df["crack"].isna().all():
@@ -301,7 +517,7 @@ with crack_col:
             "don't create artificial jumps. Dashed line marks the selected week."
         )
 
-    st.markdown("**PADD draw/build vs RB 1MS one-hour move**")
+    st.subheader("PADD Draw/Build vs RB 1MS One-Hour Move")
     correlation_lookback = st.selectbox(
         "Correlation lookback (EIA releases)",
         options=[13, 26, 48],
@@ -348,6 +564,18 @@ with crack_col:
             inventory_tightness = -paired[region]
             avg_inventory_change = paired[region].mean() if not paired.empty else None
             avg_spread_move = paired["move_1h"].mean() if not paired.empty else None
+            draw_up = int(((paired[region] < 0) & (paired["move_1h"] > 0)).sum())
+            draw_down = int(((paired[region] < 0) & (paired["move_1h"] < 0)).sum())
+            build_down = int(((paired[region] > 0) & (paired["move_1h"] < 0)).sum())
+            build_up = int(((paired[region] > 0) & (paired["move_1h"] > 0)).sum())
+            direction_matches = draw_up + build_down
+            direction_misses = draw_down + build_up
+            directional_observations = direction_matches + direction_misses
+            directional_hit_rate = (
+                direction_matches / directional_observations * 100
+                if directional_observations
+                else None
+            )
             if pd.notna(avg_inventory_change):
                 inventory_direction = "build" if avg_inventory_change >= 0 else "draw"
                 avg_inventory = f"{abs(avg_inventory_change):,.0f} K BBL {inventory_direction}"
@@ -362,6 +590,13 @@ with crack_col:
                     "avg_spread_move": (
                         f"{avg_spread_move:+.4f}" if pd.notna(avg_spread_move) else "n/a"
                     ),
+                    "directional_hit_rate": directional_hit_rate,
+                    "direction_matches": direction_matches,
+                    "direction_misses": direction_misses,
+                    "draw_up": draw_up,
+                    "draw_down": draw_down,
+                    "build_down": build_down,
+                    "build_up": build_up,
                 }
             )
 
@@ -403,4 +638,61 @@ with crack_col:
             f"compared with the signed RB 1MS price change from release time to +{REACTION_WINDOW_MINUTES} minutes. "
             f"Green means larger draws align with a stronger 1MS; red means the relationship is inverse. "
             f"{valid_reactions} of {len(reaction_history)} requested releases had usable intraday data."
+        )
+
+        st.subheader("Directional Consistency: Draw → 1MS Up / Build → 1MS Down")
+        fig_direction = go.Figure(
+            go.Bar(
+                x=correlation_df["region"],
+                y=correlation_df["directional_hit_rate"],
+                customdata=correlation_df[
+                    [
+                        "direction_matches",
+                        "direction_misses",
+                        "draw_up",
+                        "draw_down",
+                        "build_down",
+                        "build_up",
+                    ]
+                ],
+                text=correlation_df["directional_hit_rate"].map(
+                    lambda value: f"{value:.0f}%" if pd.notna(value) else "n/a"
+                ),
+                textposition="inside",
+                insidetextanchor="end",
+                textfont=dict(color="white"),
+                marker_color=[
+                    "#2ca02c" if pd.notna(value) and value >= 50 else "#d62728"
+                    for value in correlation_df["directional_hit_rate"]
+                ],
+                hovertemplate=(
+                    "%{x}<br>Directional success: %{y:.1f}%<br>"
+                    "Matches: %{customdata[0]}<br>"
+                    "Opposite: %{customdata[1]}<br>"
+                    "Draw → 1MS up: %{customdata[2]}<br>"
+                    "Draw → 1MS down: %{customdata[3]}<br>"
+                    "Build → 1MS down: %{customdata[4]}<br>"
+                    "Build → 1MS up: %{customdata[5]}"
+                    "<extra></extra>"
+                ),
+            )
+        )
+        fig_direction.add_hline(
+            y=50,
+            line_color="gray",
+            line_dash="dash",
+        )
+        fig_direction.update_layout(
+            height=300,
+            margin=dict(t=25, b=20),
+            yaxis=dict(title="Directional success rate", range=[0, 105], ticksuffix="%"),
+        )
+        st.plotly_chart(
+            fig_direction,
+            use_container_width=True,
+            key="padd_1ms_directional_consistency",
+        )
+        st.caption(
+            f"Uses the same {correlation_lookback}-release lookback selected above. "
+            "Green is at least 50% directional agreement; hover for the draw/build outcome counts."
         )
