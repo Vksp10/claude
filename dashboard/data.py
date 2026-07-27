@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
@@ -76,10 +77,23 @@ def fetch_all_padd_stocks(start_date: str, end_date: str | None = None) -> pd.Da
 def fetch_ohlc_v2(instruments: tuple[str, ...], interval: str, count: int | None = None,
                    start: int | None = None, end: int | None = None) -> pd.DataFrame:
     client = get_client()
-    try:
-        data = client.get_ohlc_v2(instruments=list(instruments), interval=interval, count=count, start=start, end=end)
-    except QHAPIError:
-        return pd.DataFrame()
+    data = None
+    for attempt in range(3):
+        try:
+            data = client.get_ohlc_v2(
+                instruments=list(instruments),
+                interval=interval,
+                count=count,
+                start=start,
+                end=end,
+            )
+            break
+        except QHAPIError:
+            if attempt == 2:
+                # Streamlit does not cache raised exceptions, so a later rerun
+                # can retry this window instead of preserving a false empty hit.
+                raise
+            time.sleep(0.4 * (2**attempt))
     items = data.get("data") if isinstance(data, dict) else data
     df = pd.DataFrame(items or [])
     if df.empty:

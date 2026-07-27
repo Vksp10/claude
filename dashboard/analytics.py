@@ -11,6 +11,22 @@ RB_1MS_TICK_SIZE = 0.0001
 RB_1MS_TICK_VALUE = 4.2
 
 
+def _resolve_1ms_code(
+    week: pd.Timestamp,
+    spread_offset: int = 0,
+    specific_spread: str | None = None,
+) -> str:
+    """Resolve a fixed or rolling adjacent-month RB spread.
+
+    spread_offset=0 is front 1MS (M1-M2), 1 is second 1MS (M2-M3), and 2 is
+    third 1MS (M3-M4).
+    """
+    if specific_spread:
+        return specific_spread
+    chain = curves.front_month_chain(week.date(), int(spread_offset) + 2)
+    return curves.combo_code(chain[int(spread_offset) :], 2)
+
+
 def _nearest_close(df: pd.DataFrame, as_of: pd.Timestamp) -> float | None:
     if df.empty:
         return None
@@ -69,9 +85,15 @@ def curve_strip_snapshot(selected_week: pd.Timestamp, compare_week: pd.Timestamp
     for name, legs in (("1MS", 2), ("1MF", 3), ("1MDF", 4)):
         strip = curves.combo_strip_codes(chain, legs)
         codes = tuple(code for code, _ in strip)
-        raw = data_mod.fetch_ohlc_v2(
-            codes, interval="1D", start=int(window_start.timestamp()), end=int(window_end.timestamp())
-        )
+        try:
+            raw = data_mod.fetch_ohlc_v2(
+                codes,
+                interval="1D",
+                start=int(window_start.timestamp()),
+                end=int(window_end.timestamp()),
+            )
+        except Exception:
+            raw = pd.DataFrame()
         df = _with_naive_dates(raw)
         rows = []
         for code, label in strip:
@@ -98,11 +120,12 @@ def curve_strip_snapshot(selected_week: pd.Timestamp, compare_week: pd.Timestamp
     return {"chain": chain, "structures": structures}
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def historical_1ms_reactions(
     all_weeks: list[pd.Timestamp],
     lookback_weeks: int = 26,
     window_minutes: int = 60,
+    spread_offset: int = 0,
+    specific_spread: str | None = None,
 ) -> pd.DataFrame:
     """One-hour RB 1MS reaction for historical EIA releases.
 
@@ -116,11 +139,14 @@ def historical_1ms_reactions(
     selected_weeks = all_weeks[-lookback_weeks:]
     mappings = []
     for week in selected_weeks:
-        chain = curves.front_month_chain(week.date(), 2)
         mappings.append(
             {
                 "week": week,
-                "spread_code": curves.combo_code(chain, 2),
+                "spread_code": _resolve_1ms_code(
+                    week,
+                    spread_offset=spread_offset,
+                    specific_spread=specific_spread,
+                ),
                 "release_utc": eia_calendar.release_datetime_utc(week),
             }
         )
@@ -174,7 +200,6 @@ def historical_1ms_reactions(
     return pd.DataFrame(rows).sort_values("week").reset_index(drop=True)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def backtest_inventory_signal_1ms(
     signal_rows: tuple[tuple[str, float], ...],
     lookback_months: int,
@@ -182,6 +207,8 @@ def backtest_inventory_signal_1ms(
     stop_dollars: float,
     target_mode: str,
     target_value: float,
+    spread_offset: int = 0,
+    specific_spread: str | None = None,
 ) -> pd.DataFrame:
     """Backtest draw-long/build-short RB 1MS trades around EIA releases.
 
@@ -222,8 +249,11 @@ def backtest_inventory_signal_1ms(
         direction = 1 if inventory_change < 0 else -1
         side = "Long" if direction == 1 else "Short"
         signal_name = "Draw" if direction == 1 else "Build"
-        chain = curves.front_month_chain(week.date(), 2)
-        spread_code = curves.combo_code(chain, 2)
+        spread_code = _resolve_1ms_code(
+            week,
+            spread_offset=spread_offset,
+            specific_spread=specific_spread,
+        )
         release_utc = eia_calendar.release_datetime_utc(week)
         holding_end = release_utc + pd.Timedelta(minutes=int(holding_minutes))
 
@@ -320,9 +350,15 @@ def crack_series(center_week: pd.Timestamp, weeks_before: int, weeks_after: int,
 
     span_start = min(window_weeks) - pd.Timedelta(weeks=1)
     span_end = max(window_weeks) + pd.Timedelta(days=3)
-    raw = data_mod.fetch_ohlc_v2(
-        distinct_codes, interval="1D", start=int(span_start.timestamp()), end=int(span_end.timestamp())
-    )
+    try:
+        raw = data_mod.fetch_ohlc_v2(
+            distinct_codes,
+            interval="1D",
+            start=int(span_start.timestamp()),
+            end=int(span_end.timestamp()),
+        )
+    except Exception:
+        raw = pd.DataFrame()
     df = _with_naive_dates(raw)
 
     rows = []

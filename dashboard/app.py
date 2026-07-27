@@ -22,6 +22,12 @@ import reaction as reaction_mod
 REACTION_WINDOW_MINUTES = 60
 DEFAULT_HISTORY_YEARS = 5
 MAX_HISTORY_YEARS = 15
+ROLLING_SPREAD_OPTIONS = {
+    "Front 1MS (M1–M2)": 0,
+    "2nd 1MS (M2–M3)": 1,
+    "3rd 1MS (M3–M4)": 2,
+    "Specific calendar spread": None,
+}
 
 st.set_page_config(page_title="US Gasoline Inventories & RB Structure", layout="wide")
 st.title("US Gasoline Inventories → RB Curve Structure & Pricing")
@@ -38,6 +44,33 @@ history_years = st.selectbox(
 )
 history_start_year = today.year - history_years + 1
 full_start = dt.date(history_start_year, 1, 1).isoformat()
+
+specific_spread_labels = {}
+for spread_month in pd.date_range(
+    start=f"{history_start_year}-01-01",
+    end=f"{today.year + 2}-12-01",
+    freq="MS",
+):
+    next_month = spread_month + pd.DateOffset(months=1)
+    spread_code = (
+        f"RB{curves.month_year_code(spread_month.year, spread_month.month)}"
+        f"-{curves.month_year_code(next_month.year, next_month.month)}"
+    )
+    specific_spread_labels[spread_code] = (
+        f"{spread_month.strftime('%b %Y')} – {next_month.strftime('%b %Y')} "
+        f"({spread_code})"
+    )
+specific_spread_codes = list(specific_spread_labels)
+current_next_month = pd.Timestamp(today.year, today.month, 1) + pd.DateOffset(months=1)
+current_specific_code = (
+    f"RB{curves.month_year_code(today.year, today.month)}"
+    f"-{curves.month_year_code(current_next_month.year, current_next_month.month)}"
+)
+specific_spread_default_index = (
+    specific_spread_codes.index(current_specific_code)
+    if current_specific_code in specific_spread_codes
+    else len(specific_spread_codes) - 1
+)
 
 with st.spinner("Loading gasoline stocks data..."):
     stocks_df = data_mod.fetch_fundamental_series(data_mod.GASOLINE_STOCKS_QHCODE, start_date=full_start)
@@ -284,14 +317,19 @@ with inventory_col:
             st.info(f"No intraday (5-minute) data available for {reaction_code} in this release window.")
 
     st.subheader("Inventory Signal Strategy Backtest")
-    bt_row_1 = st.columns(3)
+    bt_row_1 = st.columns(4)
     strategy_region = bt_row_1[0].selectbox(
         "Inventory signal",
         options=["Total US", "PADD1", "PADD2", "PADD3", "PADD4", "PADD5"],
         key="strategy_region",
     )
+    strategy_spread_mode = bt_row_1[1].selectbox(
+        "RB spread",
+        options=list(ROLLING_SPREAD_OPTIONS),
+        key="strategy_spread_mode",
+    )
     strategy_lookback_months = int(
-        bt_row_1[1].number_input(
+        bt_row_1[2].number_input(
             "Lookback (months)",
             min_value=1,
             max_value=24,
@@ -300,7 +338,7 @@ with inventory_col:
             key="strategy_lookback_months",
         )
     )
-    holding_label = bt_row_1[2].selectbox(
+    holding_label = bt_row_1[3].selectbox(
         "Maximum holding period",
         options=["30 minutes", "1 hour", "2 hours", "4 hours", "6 hours"],
         index=1,
@@ -313,6 +351,16 @@ with inventory_col:
         "4 hours": 240,
         "6 hours": 360,
     }[holding_label]
+    strategy_spread_offset = ROLLING_SPREAD_OPTIONS[strategy_spread_mode] or 0
+    strategy_specific_spread = None
+    if strategy_spread_mode == "Specific calendar spread":
+        strategy_specific_spread = st.selectbox(
+            "Specific RB spread",
+            options=specific_spread_codes,
+            index=specific_spread_default_index,
+            format_func=lambda code: specific_spread_labels[code],
+            key="strategy_specific_spread",
+        )
 
     bt_row_2 = st.columns(3)
     stop_dollars = float(
@@ -369,9 +417,20 @@ with inventory_col:
     if strategy_signal_df.empty:
         st.info(f"No inventory history is available for {strategy_region}.")
     else:
+        strategy_signal_clean = strategy_signal_df.dropna().sort_values("date")
+        strategy_cutoff = (
+            strategy_signal_clean["date"].max()
+            - pd.DateOffset(months=strategy_lookback_months)
+        )
+        strategy_requested_trades = int(
+            (
+                (strategy_signal_clean["date"] >= strategy_cutoff)
+                & (strategy_signal_clean["inventory_change"] != 0)
+            ).sum()
+        )
         strategy_signal_rows = tuple(
             (row.date.isoformat(), float(row.inventory_change))
-            for row in strategy_signal_df.dropna().itertuples(index=False)
+            for row in strategy_signal_clean.itertuples(index=False)
         )
         with st.spinner("Backtesting RB 1MS release trades..."):
             strategy_results = analytics.backtest_inventory_signal_1ms(
@@ -381,19 +440,35 @@ with inventory_col:
                 stop_dollars=stop_dollars,
                 target_mode=target_mode,
                 target_value=target_value,
+                spread_offset=strategy_spread_offset,
+                specific_spread=strategy_specific_spread,
             )
 
         if strategy_results.empty:
-            st.info("No usable RB 1MS event bars were returned for this configuration.")
+            st.warning(
+                f"No usable RB 1MS event bars were returned "
+                f"(0 of {strategy_requested_trades} requested releases)."
+            )
         else:
             total_pnl = strategy_results["pnl_dollars"].sum()
             average_pnl = strategy_results["pnl_dollars"].mean()
             win_rate = (strategy_results["pnl_dollars"] > 0).mean() * 100
-            strategy_metrics = st.columns(4)
+            usable_strategy_trades = len(strategy_results)
+            strategy_metrics = st.columns(5)
             strategy_metrics[0].metric("Total P&L", f"${total_pnl:,.0f}")
             strategy_metrics[1].metric("Average / Trade", f"${average_pnl:,.0f}")
             strategy_metrics[2].metric("Win Rate", f"{win_rate:.1f}%")
-            strategy_metrics[3].metric("Trades", f"{len(strategy_results)}")
+            strategy_metrics[3].metric("Trades", f"{usable_strategy_trades}")
+            strategy_metrics[4].metric(
+                "Data Coverage",
+                f"{usable_strategy_trades}/{strategy_requested_trades}",
+            )
+            if usable_strategy_trades < strategy_requested_trades:
+                st.warning(
+                    f"Incomplete market data: {usable_strategy_trades} of "
+                    f"{strategy_requested_trades} requested releases were usable. "
+                    "P&L metrics include usable trades only; rerun to retry missing windows."
+                )
 
             fig_strategy = go.Figure()
             fig_strategy.add_trace(
@@ -496,6 +571,7 @@ with inventory_col:
             f"One RB 1MS spread: 0.0001 tick = \\$4.20. Draws enter long; builds enter short "
             f"at the first 5-minute bar open after release. Stop \\${stop_dollars:,.2f}; "
             f"target \\${target_dollars:,.2f}; maximum hold {holding_label.lower()}. "
+            f"Spread selection: {strategy_specific_spread or strategy_spread_mode}. "
             "If stop and target trade within the same bar, the stop is applied first."
         )
 
@@ -517,18 +593,36 @@ with crack_col:
             "don't create artificial jumps. Dashed line marks the selected week."
         )
 
-    st.subheader("PADD Draw/Build vs RB 1MS One-Hour Move")
-    correlation_lookback = st.selectbox(
+    st.subheader("PADD Draw/Build vs Selected RB 1MS One-Hour Move")
+    correlation_controls = st.columns(2)
+    correlation_spread_mode = correlation_controls[0].selectbox(
+        "RB spread for correlation",
+        options=list(ROLLING_SPREAD_OPTIONS),
+        key="correlation_spread_mode",
+    )
+    correlation_lookback = correlation_controls[1].selectbox(
         "Correlation lookback (EIA releases)",
         options=[13, 26, 48],
         index=1,
         key="correlation_lookback",
     )
+    correlation_spread_offset = ROLLING_SPREAD_OPTIONS[correlation_spread_mode] or 0
+    correlation_specific_spread = None
+    if correlation_spread_mode == "Specific calendar spread":
+        correlation_specific_spread = st.selectbox(
+            "Specific RB spread for correlation",
+            options=specific_spread_codes,
+            index=specific_spread_default_index,
+            format_func=lambda code: specific_spread_labels[code],
+            key="correlation_specific_spread",
+        )
     with st.spinner("Loading historical one-hour RB 1MS reactions..."):
         reaction_history = analytics.historical_1ms_reactions(
             all_weeks,
             lookback_weeks=correlation_lookback,
             window_minutes=REACTION_WINDOW_MINUTES,
+            spread_offset=correlation_spread_offset,
+            specific_spread=correlation_specific_spread,
         )
     if reaction_history.empty or reaction_history["move_1h"].isna().all():
         st.info("No historical RB 1MS release reactions available for this lookback.")
@@ -633,10 +727,17 @@ with crack_col:
         )
         st.plotly_chart(fig_corr, use_container_width=True, key="padd_1ms_correlation")
         valid_reactions = reaction_history["move_1h"].notna().sum()
+        if valid_reactions < len(reaction_history):
+            st.warning(
+                f"Incomplete market data: {valid_reactions} of "
+                f"{len(reaction_history)} requested release windows were usable. "
+                "Correlation and directional results use available observations only."
+            )
         st.caption(
             f"Trading-sign correlation: inventory draws are positive and builds are negative, "
             f"compared with the signed RB 1MS price change from release time to +{REACTION_WINDOW_MINUTES} minutes. "
             f"Green means larger draws align with a stronger 1MS; red means the relationship is inverse. "
+            f"Spread selection: {correlation_specific_spread or correlation_spread_mode}. "
             f"{valid_reactions} of {len(reaction_history)} requested releases had usable intraday data."
         )
 

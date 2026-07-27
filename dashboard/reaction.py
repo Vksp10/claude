@@ -11,7 +11,15 @@ def price_reaction(instrument_code: str, release_date: pd.Timestamp, window_minu
     start_ts = int((release_utc - pd.Timedelta(minutes=5)).timestamp())
     end_ts = int((release_utc + pd.Timedelta(minutes=window_minutes)).timestamp())
 
-    df = data_mod.fetch_ohlc_v2((instrument_code,), interval="5M", start=start_ts, end=end_ts)
+    try:
+        df = data_mod.fetch_ohlc_v2(
+            (instrument_code,),
+            interval="5M",
+            start=start_ts,
+            end=end_ts,
+        )
+    except Exception:
+        return None
     if df.empty:
         return None
 
