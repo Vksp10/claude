@@ -29,10 +29,20 @@ ROLLING_SPREAD_OPTIONS = {
     "Specific calendar spread": None,
 }
 
-st.set_page_config(page_title="US Gasoline Inventories & RB Structure", layout="wide")
-st.title("US Gasoline Inventories → RB Curve Structure & Pricing")
-
+st.set_page_config(page_title="US Refined Product Inventories", layout="wide")
 today = dt.date.today()
+product = st.selectbox(
+    "Product",
+    options=["RB", "HO"],
+    format_func=lambda value: {
+        "RB": "RB — RBOB Gasoline",
+        "HO": "HO — ULSD / Heating Oil",
+    }[value],
+    key="product",
+)
+product_config = data_mod.PRODUCT_CONFIG[product]
+inventory_name = product_config["name"]
+st.title(f"US {inventory_name} Inventories → {product} Curve Structure & Pricing")
 
 # Use complete calendar years rather than a rolling day window. For example,
 # five years in 2026 loads data from 2022-01-01 onward.
@@ -53,7 +63,7 @@ for spread_month in pd.date_range(
 ):
     next_month = spread_month + pd.DateOffset(months=1)
     spread_code = (
-        f"RB{curves.month_year_code(spread_month.year, spread_month.month)}"
+        f"{product}{curves.month_year_code(spread_month.year, spread_month.month)}"
         f"-{curves.month_year_code(next_month.year, next_month.month)}"
     )
     specific_spread_labels[spread_code] = (
@@ -63,7 +73,7 @@ for spread_month in pd.date_range(
 specific_spread_codes = list(specific_spread_labels)
 current_next_month = pd.Timestamp(today.year, today.month, 1) + pd.DateOffset(months=1)
 current_specific_code = (
-    f"RB{curves.month_year_code(today.year, today.month)}"
+    f"{product}{curves.month_year_code(today.year, today.month)}"
     f"-{curves.month_year_code(current_next_month.year, current_next_month.month)}"
 )
 specific_spread_default_index = (
@@ -72,11 +82,16 @@ specific_spread_default_index = (
     else len(specific_spread_codes) - 1
 )
 
-with st.spinner("Loading gasoline stocks data..."):
-    stocks_df = data_mod.fetch_fundamental_series(data_mod.GASOLINE_STOCKS_QHCODE, start_date=full_start)
+with st.spinner(f"Loading {inventory_name.lower()} stocks data..."):
+    stocks_df = data_mod.fetch_fundamental_series(
+        product_config["stocks_qhcode"], start_date=full_start
+    )
 
 if stocks_df.empty:
-    st.error("No gasoline stocks data returned from the QH API.")
+    st.error(
+        f"No {inventory_name.lower()} stocks data returned from the QH API "
+        f"for {product_config['stocks_qhcode']}."
+    )
     st.stop()
 
 stocks_df["wow_change"] = stocks_df["actual"].diff()
@@ -93,7 +108,7 @@ st.caption(
 # Seasonal palette: muted history, most recent year bold/highlighted.
 _SEASONAL_PALETTE = ["#d62728", "#ff7f0e", "#2ca02c", "#9467bd", "#1f77b4", "#8c564b", "#e377c2", "#7f7f7f"]
 
-st.subheader("US Gasoline Stocks - Weekly (EIA)")
+st.subheader(f"US {inventory_name} Stocks - Weekly (EIA)")
 view_mode = st.radio(
     "View", ["Absolute Inventory", "Week-on-Week Change", "% Week-on-Week Change"], horizontal=True
 )
@@ -144,7 +159,11 @@ fig.update_layout(
 )
 
 click_event = st.plotly_chart(
-    fig, on_select="rerun", selection_mode="points", key="stocks_chart", use_container_width=True
+    fig,
+    on_select="rerun",
+    selection_mode="points",
+    key=f"stocks_chart_{product}",
+    use_container_width=True,
 )
 
 clicked_date = None
@@ -156,22 +175,26 @@ except Exception:
     clicked_date = None
 
 week_options = list(view_df["date"])
-if "selected_week_slider" not in st.session_state or st.session_state["selected_week_slider"] not in week_options:
-    st.session_state["selected_week_slider"] = week_options[-1]
+selected_week_key = f"selected_week_slider_{product}"
+if (
+    selected_week_key not in st.session_state
+    or st.session_state[selected_week_key] not in week_options
+):
+    st.session_state[selected_week_key] = week_options[-1]
 if clicked_date in week_options:
-    st.session_state["selected_week_slider"] = clicked_date
+    st.session_state[selected_week_key] = clicked_date
 
 selected_week = st.select_slider(
     "Selected week (click a point above, or use this slider)",
     options=week_options,
     format_func=lambda d: d.strftime("%Y-%m-%d"),
-    key="selected_week_slider",
+    key=selected_week_key,
 )
 st.markdown(f"**Selected week: {selected_week.date()}**")
 
 # ---------------------------------------------------------------- Full-width curve row
 st.divider()
-st.subheader("RB Curve Structure")
+st.subheader(f"{product} Curve Structure")
 ctrl_cols = st.columns(2)
 contract_range = ctrl_cols[0].number_input(
     "Contract range (months forward)", min_value=4, max_value=30, value=19, step=1, key="contract_range"
@@ -185,12 +208,14 @@ compare_week = ctrl_cols[1].selectbox(
     options=list(reversed(all_weeks)),
     index=len(all_weeks) - 1 - default_compare_idx,
     format_func=lambda d: d.strftime("%Y-%m-%d"),
-    key="compare_week",
+    key=f"compare_week_{product}",
 )
 
-strip_data = analytics.curve_strip_snapshot(selected_week, compare_week, contract_range)
-front_month_code = curves.contract_code(*strip_data["chain"][0])
-front_spread_code = curves.combo_code(strip_data["chain"], 2)
+strip_data = analytics.curve_strip_snapshot(
+    selected_week, compare_week, contract_range, product=product
+)
+front_month_code = curves.contract_code(*strip_data["chain"][0], product=product)
+front_spread_code = curves.combo_code(strip_data["chain"], 2, product=product)
 st.caption(
     f"Front-month chain starts at {front_month_code} (nearest unexpired as of {selected_week.date()}), "
     f"{contract_range} contracts forward. Comparing {selected_week.date()} (orange) vs {compare_week.date()} (white)."
@@ -214,13 +239,17 @@ for curve_col, structure_name in zip(curve_cols, ("1MS", "1MF", "1MDF")):
                        line=dict(color="#ff7f0e", width=2))
         )
         fig_s.update_layout(
-            title=f"RB - {structure_name}",
+            title=f"{product} - {structure_name}",
             height=330,
             margin=dict(t=45, b=25, l=45, r=10),
             yaxis_title="$/gal",
             legend=dict(orientation="h", y=1.16, x=0),
         )
-        st.plotly_chart(fig_s, use_container_width=True, key=f"strip_{structure_name}")
+        st.plotly_chart(
+            fig_s,
+            use_container_width=True,
+            key=f"strip_{product}_{structure_name}",
+        )
         calculated_sources = pd.concat(
             [sdf["current_source"], sdf["compare_source"]], ignore_index=True
         ).dropna()
@@ -242,7 +271,9 @@ inventory_col, crack_col = st.columns(2, gap="large")
 
 with inventory_col:
     st.subheader("Inventory Breakdown & Market Reaction")
-    padd_df = data_mod.fetch_all_padd_stocks(start_date=full_start)
+    padd_df = data_mod.fetch_all_padd_stocks(
+        start_date=full_start, product=product
+    )
 
     bars = []
     total_val = stocks_df.loc[stocks_df["date"] == selected_week, "actual"]
@@ -260,7 +291,9 @@ with inventory_col:
         bar_df = pd.DataFrame(bars)
         fig_inv = go.Figure(go.Bar(x=bar_df["region"], y=bar_df["stocks"]))
         fig_inv.update_layout(height=240, margin=dict(t=10, b=10), yaxis_title="K BBL")
-        st.plotly_chart(fig_inv, use_container_width=True, key="inv_fig")
+        st.plotly_chart(
+            fig_inv, use_container_width=True, key=f"inv_fig_{product}"
+        )
 
     try:
         base_idx = all_weeks.index(selected_week)
@@ -291,8 +324,8 @@ with inventory_col:
 
     st.subheader("Release Reaction (+%d Min Window)" % REACTION_WINDOW_MINUTES)
     for reaction_label, reaction_code in (
-        ("RB front month", front_month_code),
-        ("RB 1MS", front_spread_code),
+        (f"{product} front month", front_month_code),
+        (f"{product} 1MS", front_spread_code),
     ):
         st.markdown(f"**{reaction_label} — {reaction_code}**")
         reaction_result = reaction_mod.price_reaction(
@@ -324,7 +357,7 @@ with inventory_col:
         key="strategy_region",
     )
     strategy_spread_mode = bt_row_1[1].selectbox(
-        "RB spread",
+        f"{product} spread",
         options=list(ROLLING_SPREAD_OPTIONS),
         key="strategy_spread_mode",
     )
@@ -355,11 +388,11 @@ with inventory_col:
     strategy_specific_spread = None
     if strategy_spread_mode == "Specific calendar spread":
         strategy_specific_spread = st.selectbox(
-            "Specific RB spread",
+            f"Specific {product} spread",
             options=specific_spread_codes,
             index=specific_spread_default_index,
             format_func=lambda code: specific_spread_labels[code],
-            key="strategy_specific_spread",
+            key=f"strategy_specific_spread_{product}",
         )
 
     bt_row_2 = st.columns(3)
@@ -432,7 +465,7 @@ with inventory_col:
             (row.date.isoformat(), float(row.inventory_change))
             for row in strategy_signal_clean.itertuples(index=False)
         )
-        with st.spinner("Backtesting RB 1MS release trades..."):
+        with st.spinner(f"Backtesting {product} 1MS release trades..."):
             strategy_results = analytics.backtest_inventory_signal_1ms(
                 strategy_signal_rows,
                 lookback_months=strategy_lookback_months,
@@ -442,11 +475,12 @@ with inventory_col:
                 target_value=target_value,
                 spread_offset=strategy_spread_offset,
                 specific_spread=strategy_specific_spread,
+                product=product,
             )
 
         if strategy_results.empty:
             st.warning(
-                f"No usable RB 1MS event bars were returned "
+                f"No usable {product} 1MS event bars were returned "
                 f"(0 of {strategy_requested_trades} requested releases)."
             )
         else:
@@ -517,7 +551,7 @@ with inventory_col:
             st.plotly_chart(
                 fig_strategy,
                 use_container_width=True,
-                key="inventory_signal_strategy_chart",
+                key=f"inventory_signal_strategy_chart_{product}",
             )
 
             strategy_table = strategy_results.copy()
@@ -538,7 +572,7 @@ with inventory_col:
                     "signal": "Signal",
                     "side": "Side",
                     "inventory_change": "Inventory Change (K BBL)",
-                    "spread_code": "RB 1MS",
+                    "spread_code": f"{product} 1MS",
                     "entry_time": "Entry (ET)",
                     "exit_time": "Exit (ET)",
                     "entry_price": "Entry",
@@ -554,7 +588,7 @@ with inventory_col:
                         "Signal",
                         "Side",
                         "Inventory Change (K BBL)",
-                        "RB 1MS",
+                        f"{product} 1MS",
                         "Entry (ET)",
                         "Exit (ET)",
                         "Entry",
@@ -568,7 +602,7 @@ with inventory_col:
             )
 
         st.caption(
-            f"One RB 1MS spread: 0.0001 tick = \\$4.20. Draws enter long; builds enter short "
+            f"One {product} 1MS spread: 0.0001 tick = \\$4.20. Draws enter long; builds enter short "
             f"at the first 5-minute bar open after release. Stop \\${stop_dollars:,.2f}; "
             f"target \\${target_dollars:,.2f}; maximum hold {holding_label.lower()}. "
             f"Spread selection: {strategy_specific_spread or strategy_spread_mode}. "
@@ -576,27 +610,36 @@ with inventory_col:
         )
 
 with crack_col:
-    st.subheader("Gasoline Crack Spread Context")
+    st.subheader(f"{inventory_name} Crack Spread Context")
     crack_span = st.slider("Weeks each side of selected week", 2, 4, 3, key="crack_span")
-    crack_df = analytics.crack_series(selected_week, crack_span, crack_span, all_weeks)
+    crack_df = analytics.crack_series(
+        selected_week, crack_span, crack_span, all_weeks, product=product
+    )
     if crack_df.empty or crack_df["crack"].isna().all():
         st.info("No crack spread data available for this window.")
     else:
         fig_crack = go.Figure(
-            go.Scatter(x=crack_df["week"], y=crack_df["crack"], mode="lines+markers", name="RB-CL crack ($/bbl)")
+            go.Scatter(
+                x=crack_df["week"],
+                y=crack_df["crack"],
+                mode="lines+markers",
+                name=f"{product}-CL crack ($/bbl)",
+            )
         )
         fig_crack.add_vline(x=selected_week, line_dash="dash", line_color="gray")
         fig_crack.update_layout(height=260, margin=dict(t=10, b=10), yaxis_title="$/bbl")
-        st.plotly_chart(fig_crack, use_container_width=True, key="crack_fig")
+        st.plotly_chart(
+            fig_crack, use_container_width=True, key=f"crack_fig_{product}"
+        )
         st.caption(
-            "Front-month RB-CL crack spread (RBCL<contract>), re-resolved per week so contract rolls "
+            f"Front-month {product}-CL crack spread ({product}CL<contract>), re-resolved per week so contract rolls "
             "don't create artificial jumps. Dashed line marks the selected week."
         )
 
-    st.subheader("PADD Draw/Build vs Selected RB 1MS One-Hour Move")
+    st.subheader(f"PADD Draw/Build vs Selected {product} 1MS One-Hour Move")
     correlation_controls = st.columns(2)
     correlation_spread_mode = correlation_controls[0].selectbox(
-        "RB spread for correlation",
+        f"{product} spread for correlation",
         options=list(ROLLING_SPREAD_OPTIONS),
         key="correlation_spread_mode",
     )
@@ -610,22 +653,25 @@ with crack_col:
     correlation_specific_spread = None
     if correlation_spread_mode == "Specific calendar spread":
         correlation_specific_spread = st.selectbox(
-            "Specific RB spread for correlation",
+            f"Specific {product} spread for correlation",
             options=specific_spread_codes,
             index=specific_spread_default_index,
             format_func=lambda code: specific_spread_labels[code],
-            key="correlation_specific_spread",
+            key=f"correlation_specific_spread_{product}",
         )
-    with st.spinner("Loading historical one-hour RB 1MS reactions..."):
+    with st.spinner(f"Loading historical one-hour {product} 1MS reactions..."):
         reaction_history = analytics.historical_1ms_reactions(
             all_weeks,
             lookback_weeks=correlation_lookback,
             window_minutes=REACTION_WINDOW_MINUTES,
             spread_offset=correlation_spread_offset,
             specific_spread=correlation_specific_spread,
+            product=product,
         )
     if reaction_history.empty or reaction_history["move_1h"].isna().all():
-        st.info("No historical RB 1MS release reactions available for this lookback.")
+        st.info(
+            f"No historical {product} 1MS release reactions available for this lookback."
+        )
     else:
         inventory_changes = stocks_df[["date", "wow_change"]].rename(
             columns={"wow_change": "Total US"}
@@ -654,7 +700,7 @@ with crack_col:
             # Trading convention: inventory tightening is positive. Therefore a
             # draw (negative raw EIA change) becomes positive, while a build
             # becomes negative. A positive correlation then reads intuitively as
-            # larger draw/tighter stocks -> stronger (upward) RB 1MS.
+            # larger draw/tighter stocks -> stronger (upward) product 1MS.
             inventory_tightness = -paired[region]
             avg_inventory_change = paired[region].mean() if not paired.empty else None
             avg_spread_move = paired["move_1h"].mean() if not paired.empty else None
@@ -725,7 +771,11 @@ with crack_col:
             margin=dict(t=20, b=20),
             yaxis=dict(title="Correlation (draw positive)", range=[-1, 1]),
         )
-        st.plotly_chart(fig_corr, use_container_width=True, key="padd_1ms_correlation")
+        st.plotly_chart(
+            fig_corr,
+            use_container_width=True,
+            key=f"padd_1ms_correlation_{product}",
+        )
         valid_reactions = reaction_history["move_1h"].notna().sum()
         if valid_reactions < len(reaction_history):
             st.warning(
@@ -735,7 +785,7 @@ with crack_col:
             )
         st.caption(
             f"Trading-sign correlation: inventory draws are positive and builds are negative, "
-            f"compared with the signed RB 1MS price change from release time to +{REACTION_WINDOW_MINUTES} minutes. "
+            f"compared with the signed {product} 1MS price change from release time to +{REACTION_WINDOW_MINUTES} minutes. "
             f"Green means larger draws align with a stronger 1MS; red means the relationship is inverse. "
             f"Spread selection: {correlation_specific_spread or correlation_spread_mode}. "
             f"{valid_reactions} of {len(reaction_history)} requested releases had usable intraday data."
@@ -791,7 +841,7 @@ with crack_col:
         st.plotly_chart(
             fig_direction,
             use_container_width=True,
-            key="padd_1ms_directional_consistency",
+            key=f"padd_1ms_directional_consistency_{product}",
         )
         st.caption(
             f"Uses the same {correlation_lookback}-release lookback selected above. "

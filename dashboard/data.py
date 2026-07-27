@@ -9,14 +9,26 @@ import streamlit as st
 import eia_calendar
 from qh_api import QHAPIClient, QHAPIError
 
-GASOLINE_STOCKS_QHCODE = "US Gasoline Stocks_1W"
-PADD_STOCKS_QHCODES = {
-    1: "US PADD1 Gasoline Stocks_1W",
-    2: "US PADD2 Gasoline Stocks_1W",
-    3: "US PADD3 Gasoline Stocks_1W",
-    4: "US PADD4 Gasoline Stocks_1W",
-    5: "US PADD5 Gasoline Stocks_1W",
+PRODUCT_CONFIG = {
+    "RB": {
+        "name": "Gasoline",
+        "stocks_qhcode": "US Gasoline Stocks_1W",
+        "padd_qhcodes": {
+            padd: f"US PADD{padd} Gasoline Stocks_1W" for padd in range(1, 6)
+        },
+    },
+    "HO": {
+        "name": "Distillate",
+        "stocks_qhcode": "US Distillate Stocks_1W",
+        "padd_qhcodes": {
+            padd: f"US PADD{padd} Distillate Stocks_1W" for padd in range(1, 6)
+        },
+    },
 }
+
+# Backward-compatible aliases for callers outside the dashboard.
+GASOLINE_STOCKS_QHCODE = PRODUCT_CONFIG["RB"]["stocks_qhcode"]
+PADD_STOCKS_QHCODES = PRODUCT_CONFIG["RB"]["padd_qhcodes"]
 
 
 @st.cache_resource
@@ -60,9 +72,11 @@ def fetch_fundamental_series(qhcode: str, start_date: str, end_date: str | None 
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_all_padd_stocks(start_date: str, end_date: str | None = None) -> pd.DataFrame:
+def fetch_all_padd_stocks(
+    start_date: str, end_date: str | None = None, product: str = "RB"
+) -> pd.DataFrame:
     frames = []
-    for padd, qhcode in PADD_STOCKS_QHCODES.items():
+    for padd, qhcode in PRODUCT_CONFIG[product]["padd_qhcodes"].items():
         df = fetch_fundamental_series(qhcode, start_date, end_date)
         if df.empty:
             continue

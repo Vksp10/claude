@@ -7,16 +7,17 @@ import curves
 import data as data_mod
 import eia_calendar
 
-RB_1MS_TICK_SIZE = 0.0001
-RB_1MS_TICK_VALUE = 4.2
+PRODUCT_1MS_TICK_SIZE = 0.0001
+PRODUCT_1MS_TICK_VALUE = 4.2
 
 
 def _resolve_1ms_code(
     week: pd.Timestamp,
     spread_offset: int = 0,
     specific_spread: str | None = None,
+    product: str = "RB",
 ) -> str:
-    """Resolve a fixed or rolling adjacent-month RB spread.
+    """Resolve a fixed or rolling adjacent-month product spread.
 
     spread_offset=0 is front 1MS (M1-M2), 1 is second 1MS (M2-M3), and 2 is
     third 1MS (M3-M4).
@@ -24,7 +25,7 @@ def _resolve_1ms_code(
     if specific_spread:
         return specific_spread
     chain = curves.front_month_chain(week.date(), int(spread_offset) + 2)
-    return curves.combo_code(chain[int(spread_offset) :], 2)
+    return curves.combo_code(chain[int(spread_offset) :], 2, product)
 
 
 def _nearest_close(df: pd.DataFrame, as_of: pd.Timestamp) -> float | None:
@@ -73,7 +74,12 @@ def _fill_from_adjacent(
     return target
 
 
-def curve_strip_snapshot(selected_week: pd.Timestamp, compare_week: pd.Timestamp, n_months: int) -> dict:
+def curve_strip_snapshot(
+    selected_week: pd.Timestamp,
+    compare_week: pd.Timestamp,
+    n_months: int,
+    product: str = "RB",
+) -> dict:
     """Full forward-strip 1MS/1MF/1MDF snapshot: current (selected week) vs a
     comparison week, across `n_months` consecutive contracts starting at the
     nearest-unexpired contract as of the selected week."""
@@ -83,7 +89,7 @@ def curve_strip_snapshot(selected_week: pd.Timestamp, compare_week: pd.Timestamp
 
     structures: dict[str, pd.DataFrame] = {}
     for name, legs in (("1MS", 2), ("1MF", 3), ("1MDF", 4)):
-        strip = curves.combo_strip_codes(chain, legs)
+        strip = curves.combo_strip_codes(chain, legs, product)
         codes = tuple(code for code, _ in strip)
         try:
             raw = data_mod.fetch_ohlc_v2(
@@ -126,8 +132,9 @@ def historical_1ms_reactions(
     window_minutes: int = 60,
     spread_offset: int = 0,
     specific_spread: str | None = None,
+    product: str = "RB",
 ) -> pd.DataFrame:
-    """One-hour RB 1MS reaction for historical EIA releases.
+    """One-hour product 1MS reaction for historical EIA releases.
 
     Each API request is restricted to the 65-minute event window. This is much
     faster than downloading month-wide five-minute histories and the completed
@@ -146,6 +153,7 @@ def historical_1ms_reactions(
                     week,
                     spread_offset=spread_offset,
                     specific_spread=specific_spread,
+                    product=product,
                 ),
                 "release_utc": eia_calendar.release_datetime_utc(week),
             }
@@ -209,12 +217,13 @@ def backtest_inventory_signal_1ms(
     target_value: float,
     spread_offset: int = 0,
     specific_spread: str | None = None,
+    product: str = "RB",
 ) -> pd.DataFrame:
-    """Backtest draw-long/build-short RB 1MS trades around EIA releases.
+    """Backtest draw-long/build-short product 1MS trades around EIA releases.
 
     The trade enters at the open of the first five-minute bar timestamped at or
     after the EIA release. Stops and targets are expressed as P&L dollars for
-    one RB 1MS spread, using a 0.0001 tick worth $4.20. If both levels trade in
+    one product 1MS spread, using a 0.0001 tick worth $4.20. If both levels trade in
     the same bar, the stop is assumed to fill first (conservative sequencing).
     """
     if not signal_rows:
@@ -231,13 +240,17 @@ def backtest_inventory_signal_1ms(
 
     cutoff = signals["week"].max() - pd.DateOffset(months=int(lookback_months))
     signals = signals[signals["week"] >= cutoff]
-    stop_offset = float(stop_dollars) / RB_1MS_TICK_VALUE * RB_1MS_TICK_SIZE
+    stop_offset = (
+        float(stop_dollars) / PRODUCT_1MS_TICK_VALUE * PRODUCT_1MS_TICK_SIZE
+    )
     target_dollars = (
         float(stop_dollars) * float(target_value)
         if target_mode == "Stop multiple"
         else float(target_value)
     )
-    target_offset = target_dollars / RB_1MS_TICK_VALUE * RB_1MS_TICK_SIZE
+    target_offset = (
+        target_dollars / PRODUCT_1MS_TICK_VALUE * PRODUCT_1MS_TICK_SIZE
+    )
 
     results = []
     for signal in signals.itertuples(index=False):
@@ -253,6 +266,7 @@ def backtest_inventory_signal_1ms(
             week,
             spread_offset=spread_offset,
             specific_spread=specific_spread,
+            product=product,
         )
         release_utc = eia_calendar.release_datetime_utc(week)
         holding_end = release_utc + pd.Timedelta(minutes=int(holding_minutes))
@@ -310,7 +324,7 @@ def backtest_inventory_signal_1ms(
 
         signed_price_move = (exit_price - entry_price) * direction
         pnl_dollars = (
-            signed_price_move / RB_1MS_TICK_SIZE * RB_1MS_TICK_VALUE
+            signed_price_move / PRODUCT_1MS_TICK_SIZE * PRODUCT_1MS_TICK_VALUE
         )
         results.append(
             {
@@ -335,8 +349,14 @@ def backtest_inventory_signal_1ms(
     return result
 
 
-def crack_series(center_week: pd.Timestamp, weeks_before: int, weeks_after: int, all_weeks: list[pd.Timestamp]) -> pd.DataFrame:
-    """Front-month RB-CL crack spread across a window of weeks, re-resolving the
+def crack_series(
+    center_week: pd.Timestamp,
+    weeks_before: int,
+    weeks_after: int,
+    all_weeks: list[pd.Timestamp],
+    product: str = "RB",
+) -> pd.DataFrame:
+    """Front-month product-CL crack spread across a window of weeks, re-resolving the
     front-month contract for each week so contract rolls don't create fake jumps."""
     try:
         idx = all_weeks.index(center_week)
@@ -345,7 +365,10 @@ def crack_series(center_week: pd.Timestamp, weeks_before: int, weeks_after: int,
     except ValueError:
         window_weeks = [center_week + pd.Timedelta(weeks=o) for o in range(-weeks_before, weeks_after + 1)]
 
-    codes_by_week = {wk: curves.curve_codes(wk.date())["crack_front"] for wk in window_weeks}
+    codes_by_week = {
+        wk: curves.curve_codes(wk.date(), product=product)["crack_front"]
+        for wk in window_weeks
+    }
     distinct_codes = tuple(sorted(set(codes_by_week.values())))
 
     span_start = min(window_weeks) - pd.Timedelta(weeks=1)

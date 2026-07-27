@@ -20,9 +20,9 @@ def month_year_code(year: int, month: int) -> str:
     return f"{month_code(month)}{year % 100:02d}"
 
 
-def contract_code(year: int, month: int) -> str:
-    """Standalone RB contract code, e.g. (2026, 1) -> 'RBF26'"""
-    return f"RB{month_year_code(year, month)}"
+def contract_code(year: int, month: int, product: str = "RB") -> str:
+    """Standalone futures contract code, e.g. (2026, 1, "HO") -> "HOF26"."""
+    return f"{product}{month_year_code(year, month)}"
 
 
 def _last_business_day(year: int, month: int) -> pd.Timestamp:
@@ -33,8 +33,8 @@ def _last_business_day(year: int, month: int) -> pd.Timestamp:
 
 
 def expiry_date(year: int, month: int) -> pd.Timestamp:
-    """RBOB gasoline futures expire on the last business day of the month
-    prior to the contract month (standard NYMEX convention)."""
+    """RB and HO futures expire on the last business day of the month before
+    the contract month (standard NYMEX convention)."""
     prev_month_end = pd.Timestamp(year=year, month=month, day=1) - pd.Timedelta(days=1)
     return _last_business_day(prev_month_end.year, prev_month_end.month)
 
@@ -58,32 +58,34 @@ def front_month_chain(as_of: dt.date, n: int = 4) -> list[tuple[int, int]]:
     return chain
 
 
-def combo_code(chain: list[tuple[int, int]], legs: int) -> str:
+def combo_code(chain: list[tuple[int, int]], legs: int, product: str = "RB") -> str:
     """Build a QH combo instrument code (spread/fly/double-fly) from the first `legs`
     entries of a front-month chain, e.g. legs=2 -> 'RBF26-G26'."""
     codes = [month_year_code(y, m) for y, m in chain[:legs]]
-    return "RB" + "-".join(codes)
+    return product + "-".join(codes)
 
 
-def combo_strip_codes(chain: list[tuple[int, int]], legs: int) -> list[tuple[str, str]]:
+def combo_strip_codes(
+    chain: list[tuple[int, int]], legs: int, product: str = "RB"
+) -> list[tuple[str, str]]:
     """Rolling combo codes across a whole contract chain, e.g. legs=2 on
     [F26,G26,H26,J26] -> [('RBF26-G26','F26'), ('RBG26-H26','G26'), ('RBH26-J26','H26')].
     The second element of each tuple is the leading-leg label, used as the x-axis tick."""
     codes = [month_year_code(y, m) for y, m in chain]
     out = []
     for i in range(len(codes) - legs + 1):
-        out.append(("RB" + "-".join(codes[i : i + legs]), codes[i]))
+        out.append((product + "-".join(codes[i : i + legs]), codes[i]))
     return out
 
 
-def curve_codes(as_of: dt.date, n_months: int = 4) -> dict:
+def curve_codes(as_of: dt.date, n_months: int = 4, product: str = "RB") -> dict:
     """All instrument codes needed to render the curve-structure panel for one week."""
     chain = front_month_chain(as_of, n_months)
-    legs = [contract_code(y, m) for y, m in chain]
-    spread = combo_code(chain, 2) if len(chain) >= 2 else None
-    fly = combo_code(chain, 3) if len(chain) >= 3 else None
-    double_fly = combo_code(chain, 4) if len(chain) >= 4 else None
-    crack_front = f"RBCL{month_year_code(*chain[0])}"
+    legs = [contract_code(y, m, product) for y, m in chain]
+    spread = combo_code(chain, 2, product) if len(chain) >= 2 else None
+    fly = combo_code(chain, 3, product) if len(chain) >= 3 else None
+    double_fly = combo_code(chain, 4, product) if len(chain) >= 4 else None
+    crack_front = f"{product}CL{month_year_code(*chain[0])}"
     return {
         "chain": chain,
         "legs": legs,
