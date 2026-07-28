@@ -350,7 +350,7 @@ with inventory_col:
             st.info(f"No intraday (5-minute) data available for {reaction_code} in this release window.")
 
     st.subheader("Inventory Signal Strategy Backtest")
-    bt_row_1 = st.columns(4)
+    bt_row_1 = st.columns(5)
     strategy_region = bt_row_1[0].selectbox(
         "Inventory signal",
         options=["Total US", "PADD1", "PADD2", "PADD3", "PADD4", "PADD5"],
@@ -376,6 +376,16 @@ with inventory_col:
         options=["30 minutes", "1 hour", "2 hours", "4 hours", "6 hours"],
         index=1,
         key="strategy_holding_period",
+    )
+    strategy_min_change = float(
+        bt_row_1[4].number_input(
+            "Min build/draw (K BBL)",
+            min_value=0.0,
+            value=0.0,
+            step=100.0,
+            help="Exclude inventory changes whose absolute size is below this threshold.",
+            key="strategy_min_change",
+        )
     )
     holding_minutes = {
         "30 minutes": 30,
@@ -459,11 +469,23 @@ with inventory_col:
             (
                 (strategy_signal_clean["date"] >= strategy_cutoff)
                 & (strategy_signal_clean["inventory_change"] != 0)
+                & (
+                    strategy_signal_clean["inventory_change"].abs()
+                    >= strategy_min_change
+                )
             ).sum()
         )
+        strategy_eligible = strategy_signal_clean[
+            (strategy_signal_clean["date"] >= strategy_cutoff)
+            & (strategy_signal_clean["inventory_change"] != 0)
+            & (
+                strategy_signal_clean["inventory_change"].abs()
+                >= strategy_min_change
+            )
+        ]
         strategy_signal_rows = tuple(
             (row.date.isoformat(), float(row.inventory_change))
-            for row in strategy_signal_clean.itertuples(index=False)
+            for row in strategy_eligible.itertuples(index=False)
         )
         with st.spinner(f"Backtesting {product} 1MS release trades..."):
             strategy_results = analytics.backtest_inventory_signal_1ms(
@@ -479,10 +501,16 @@ with inventory_col:
             )
 
         if strategy_results.empty:
-            st.warning(
-                f"No usable {product} 1MS event bars were returned "
-                f"(0 of {strategy_requested_trades} requested releases)."
-            )
+            if strategy_requested_trades == 0:
+                st.info(
+                    f"No {strategy_region} builds or draws meet the "
+                    f"{strategy_min_change:,.0f} K BBL minimum in this lookback."
+                )
+            else:
+                st.warning(
+                    f"No usable {product} 1MS event bars were returned "
+                    f"(0 of {strategy_requested_trades} requested releases)."
+                )
         else:
             total_pnl = strategy_results["pnl_dollars"].sum()
             average_pnl = strategy_results["pnl_dollars"].mean()
@@ -605,6 +633,7 @@ with inventory_col:
             f"One {product} 1MS spread: 0.0001 tick = \\$4.20. Draws enter long; builds enter short "
             f"at the first 5-minute bar open after release. Stop \\${stop_dollars:,.2f}; "
             f"target \\${target_dollars:,.2f}; maximum hold {holding_label.lower()}. "
+            f"Minimum absolute build/draw {strategy_min_change:,.0f} K BBL. "
             f"Spread selection: {strategy_specific_spread or strategy_spread_mode}. "
             "If stop and target trade within the same bar, the stop is applied first."
         )
@@ -637,7 +666,7 @@ with crack_col:
         )
 
     st.subheader(f"PADD Draw/Build vs Selected {product} 1MS One-Hour Move")
-    correlation_controls = st.columns(2)
+    correlation_controls = st.columns(3)
     correlation_spread_mode = correlation_controls[0].selectbox(
         f"{product} spread for correlation",
         options=list(ROLLING_SPREAD_OPTIONS),
@@ -648,6 +677,19 @@ with crack_col:
         options=[13, 26, 48],
         index=1,
         key="correlation_lookback",
+    )
+    directional_min_change = float(
+        correlation_controls[2].number_input(
+            "Directional min build/draw (K BBL)",
+            min_value=0.0,
+            value=0.0,
+            step=100.0,
+            help=(
+                "For directional consistency only, exclude each region's releases "
+                "whose absolute inventory change is below this threshold."
+            ),
+            key="directional_min_change",
+        )
     )
     correlation_spread_offset = ROLLING_SPREAD_OPTIONS[correlation_spread_mode] or 0
     correlation_specific_spread = None
@@ -704,10 +746,33 @@ with crack_col:
             inventory_tightness = -paired[region]
             avg_inventory_change = paired[region].mean() if not paired.empty else None
             avg_spread_move = paired["move_1h"].mean() if not paired.empty else None
-            draw_up = int(((paired[region] < 0) & (paired["move_1h"] > 0)).sum())
-            draw_down = int(((paired[region] < 0) & (paired["move_1h"] < 0)).sum())
-            build_down = int(((paired[region] > 0) & (paired["move_1h"] < 0)).sum())
-            build_up = int(((paired[region] > 0) & (paired["move_1h"] > 0)).sum())
+            directional_paired = paired[
+                paired[region].abs() >= directional_min_change
+            ]
+            draw_up = int(
+                (
+                    (directional_paired[region] < 0)
+                    & (directional_paired["move_1h"] > 0)
+                ).sum()
+            )
+            draw_down = int(
+                (
+                    (directional_paired[region] < 0)
+                    & (directional_paired["move_1h"] < 0)
+                ).sum()
+            )
+            build_down = int(
+                (
+                    (directional_paired[region] > 0)
+                    & (directional_paired["move_1h"] < 0)
+                ).sum()
+            )
+            build_up = int(
+                (
+                    (directional_paired[region] > 0)
+                    & (directional_paired["move_1h"] > 0)
+                ).sum()
+            )
             direction_matches = draw_up + build_down
             direction_misses = draw_down + build_up
             directional_observations = direction_matches + direction_misses
@@ -845,5 +910,6 @@ with crack_col:
         )
         st.caption(
             f"Uses the same {correlation_lookback}-release lookback selected above. "
+            f"Only absolute builds/draws of at least {directional_min_change:,.0f} K BBL are included. "
             "Green is at least 50% directional agreement; hover for the draw/build outcome counts."
         )
